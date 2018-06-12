@@ -1,7 +1,7 @@
 /*********************************************************************
  * Software License Agreement (BSD License)
  *
- *  Copyright (c) 2015, University of Colorado, Boulder
+ *  Copyright (c) 2008, Willow Garage, Inc.
  *  All rights reserved.
  *
  *  Redistribution and use in source and binary forms, with or without
@@ -14,7 +14,7 @@
  *     copyright notice, this list of conditions and the following
  *     disclaimer in the documentation and/or other materials provided
  *     with the distribution.
- *   * Neither the name of the Univ of CO, Boulder nor the names of its
+ *   * Neither the name of Willow Garage nor the names of its
  *     contributors may be used to endorse or promote products derived
  *     from this software without specific prior written permission.
  *
@@ -32,100 +32,506 @@
  *  POSSIBILITY OF SUCH DAMAGE.
  *********************************************************************/
 
-/* Author: Dave Coleman
-   Desc:   Wraps a trajectory_visualization playback class for Rviz into a stand alone display
-*/
+/* Author: Dave Coleman */
 
-#include <moveit/trajectory_rviz_plugin/trajectory_display.h>
+#include <boost/interprocess/sync/scoped_lock.hpp>
+#include <boost/signals2/mutex.hpp>
+
+#include <boost/algorithm/string.hpp>
+#include <boost/algorithm/string/replace.hpp>
+
+#include <moveit/rviz_plugin_render_tools/trajectory_visualization.h>
+
+#include <moveit/rviz_plugin_render_tools/planning_link_updater.h>
+#include <moveit/rviz_plugin_render_tools/robot_state_visualization.h>
+#include <rviz/robot/robot.h>
+
+#include <rviz/properties/property.h>
+#include <rviz/properties/int_property.h>
 #include <rviz/properties/string_property.h>
+#include <rviz/properties/bool_property.h>
+#include <rviz/properties/float_property.h>
+#include <rviz/properties/ros_topic_property.h>
+#include <rviz/properties/editable_enum_property.h>
+#include <rviz/properties/color_property.h>
+#include <moveit/trajectory_processing/trajectory_tools.h>
+#include <rviz/robot/robot_link.h>
+#include <rviz/display_context.h>
+#include <rviz/window_manager_interface.h>
 
 namespace moveit_rviz_plugin
 {
-TrajectoryDisplay::TrajectoryDisplay() : Display(), load_robot_model_(false)
+TrajectoryVisualization::TrajectoryVisualization(rviz::Property* widget, rviz::Display* display)
+  : display_(display)
+  , widget_(widget)
+  , animating_path_(false)
+  , drop_displaying_trajectory_(false)
+  , current_state_(-1)
+  , trajectory_slider_panel_(NULL)
+  , trajectory_slider_dock_panel_(NULL)
 {
-  // The robot description property is only needed when using the trajectory playback standalone (not within motion
-  // planning plugin)
-  robot_description_property_ = new rviz::StringProperty(
-      "Robot Description", "robot_description", "The name of the ROS parameter where the URDF for the robot is loaded",
-      this, SLOT(changedRobotDescription()), this);
+  trajectory_topic_property_ =
+      new rviz::RosTopicProperty("Trajectory Topic", "/move_group/display_planned_path",
+                                 ros::message_traits::datatype<moveit_msgs::DisplayTrajectory>(),
+                                 "The topic on which the moveit_msgs::DisplayTrajectory messages are received", widget,
+                                 SLOT(changedTrajectoryTopic()), this);
 
-  trajectory_visual_.reset(new TrajectoryVisualization(this, this));
+  display_path_visual_enabled_property_ =
+      new rviz::BoolProperty("Show Robot Visual", true, "Indicates whether the geometry of the robot as defined for "
+                                                        "visualisation purposes should be displayed",
+                             widget, SLOT(changedDisplayPathVisualEnabled()), this);
+
+  display_path_collision_enabled_property_ =
+      new rviz::BoolProperty("Show Robot Collision", false, "Indicates whether the geometry of the robot as defined "
+                                                            "for collision detection purposes should be displayed",
+                             widget, SLOT(changedDisplayPathCollisionEnabled()), this);
+
+  robot_path_alpha_property_ = new rviz::FloatProperty("Robot Alpha", 0.5f, "Specifies the alpha for the robot links",
+                                                       widget, SLOT(changedRobotPathAlpha()), this);
+  robot_path_alpha_property_->setMin(0.0);
+  robot_path_alpha_property_->setMax(1.0);
+
+  state_display_time_property_ = new rviz::EditableEnumProperty("State Display Time", "0.05 s",
+                                                                "The amount of wall-time to wait in between displaying "
+                                                                "states along a received trajectory path",
+                                                                widget, SLOT(changedStateDisplayTime()), this);
+  state_display_time_property_->addOptionStd("REALTIME");
+  state_display_time_property_->addOptionStd("0.05 s");
+  state_display_time_property_->addOptionStd("0.1 s");
+  state_display_time_property_->addOptionStd("0.5 s");
+
+  loop_display_property_ = new rviz::BoolProperty("Loop Animation", false, "Indicates whether the last received path "
+                                                                           "is to be animated in a loop",
+                                                  widget, SLOT(changedLoopDisplay()), this);
+
+  trail_display_property_ =
+      new rviz::BoolProperty("Show Trail", false, "Show a path trail", widget, SLOT(changedShowTrail()), this);
+
+  trail_step_size_property_ = new rviz::IntProperty("Trail Step Size", 1, "Specifies the step size of the samples "
+                                                                          "shown in the trajectory trail.",
+                                                    widget, SLOT(changedTrailStepSize()), this);
+  trail_step_size_property_->setMin(1);
+
+  interrupt_display_property_ = new rviz::BoolProperty(
+      "Interrupt Display", false,
+      "Immediately show newly planned trajectory, interrupting the currently displayed one.", widget);
+
+  robot_color_property_ = new rviz::ColorProperty(
+      "Robot Color", QColor(150, 50, 150), "The color of the animated robot", widget, SLOT(changedRobotColor()), this);
+
+  enable_robot_color_property_ = new rviz::BoolProperty(
+      "Color Enabled", false, "Specifies whether robot coloring is enabled", widget, SLOT(enabledRobotColor()), this);
 }
 
-TrajectoryDisplay::~TrajectoryDisplay()
+TrajectoryVisualization::~TrajectoryVisualization()
 {
+  clearTrajectoryTrail();
+  trajectory_message_to_display_.reset();
+  displaying_trajectory_message_.reset();
+
+  display_path_robot_.reset();
+  if (trajectory_slider_dock_panel_)
+    delete trajectory_slider_dock_panel_;
 }
 
-void TrajectoryDisplay::onInitialize()
+void TrajectoryVisualization::onInitialize(Ogre::SceneNode* scene_node, rviz::DisplayContext* context,
+                                           ros::NodeHandle update_nh)
 {
-  Display::onInitialize();
+  // Save pointers for later use
+  scene_node_ = scene_node;
+  context_ = context;
+  update_nh_ = update_nh;
 
-  trajectory_visual_->onInitialize(scene_node_, context_, update_nh_);
-}
+  // Load trajectory robot
+  display_path_robot_.reset(new RobotStateVisualization(scene_node_, context_, "Planned Path", widget_));
+  display_path_robot_->setVisualVisible(display_path_visual_enabled_property_->getBool());
+  display_path_robot_->setCollisionVisible(display_path_collision_enabled_property_->getBool());
+  display_path_robot_->setVisible(false);
 
-void TrajectoryDisplay::loadRobotModel()
-{
-  load_robot_model_ = false;
-  rdf_loader_.reset(new rdf_loader::RDFLoader(robot_description_property_->getStdString()));
-
-  if (!rdf_loader_->getURDF())
+  rviz::WindowManagerInterface* window_context = context_->getWindowManager();
+  if (window_context)
   {
-    this->setStatus(rviz::StatusProperty::Error, "Robot Model",
-                    "Failed to load from parameter " + robot_description_property_->getString());
+    trajectory_slider_panel_ = new TrajectoryPanel(window_context->getParentWindow());
+    trajectory_slider_dock_panel_ =
+        window_context->addPane(display_->getName() + " - Trajectory Slider", trajectory_slider_panel_);
+    trajectory_slider_dock_panel_->setIcon(display_->getIcon());
+    connect(trajectory_slider_dock_panel_, SIGNAL(visibilityChanged(bool)), this,
+            SLOT(trajectorySliderPanelVisibilityChange(bool)));
+    trajectory_slider_panel_->onInitialize();
+  }
+}
+
+void TrajectoryVisualization::setName(const QString& name)
+{
+  if (trajectory_slider_dock_panel_)
+    trajectory_slider_dock_panel_->setWindowTitle(name + " - Slider");
+}
+
+void TrajectoryVisualization::onRobotModelLoaded(robot_model::RobotModelConstPtr robot_model)
+{
+  robot_model_ = robot_model;
+
+  // Error check
+  if (!robot_model_)
+  {
+    ROS_ERROR_STREAM_NAMED("trajectory_visualization", "No robot model found");
     return;
   }
-  this->setStatus(rviz::StatusProperty::Ok, "Robot Model", "Successfully loaded");
 
-  const srdf::ModelSharedPtr& srdf =
-      rdf_loader_->getSRDF() ? rdf_loader_->getSRDF() : srdf::ModelSharedPtr(new srdf::Model());
-  robot_model_.reset(new robot_model::RobotModel(rdf_loader_->getURDF(), srdf));
+  // Load robot state
+  robot_state_.reset(new robot_state::RobotState(robot_model_));
+  robot_state_->setToDefaultValues();
 
-  // Send to child class
-  trajectory_visual_->onRobotModelLoaded(robot_model_);
-  trajectory_visual_->onEnable();
+  // Load rviz robot
+  display_path_robot_->load(*robot_model_->getURDF());
+  enabledRobotColor();  // force-refresh to account for saved display configuration
 }
 
-void TrajectoryDisplay::reset()
+void TrajectoryVisualization::reset()
 {
-  Display::reset();
-  loadRobotModel();
-  trajectory_visual_->reset();
+  clearTrajectoryTrail();
+  trajectory_message_to_display_.reset();
+  displaying_trajectory_message_.reset();
+  animating_path_ = false;
+
+  display_path_robot_->setVisualVisible(display_path_visual_enabled_property_->getBool());
+  display_path_robot_->setCollisionVisible(display_path_collision_enabled_property_->getBool());
+  display_path_robot_->setVisible(false);
 }
 
-void TrajectoryDisplay::onEnable()
+void TrajectoryVisualization::clearTrajectoryTrail()
 {
-  Display::onEnable();
-  load_robot_model_ = true;  // allow loading of robot model in update()
+  for (std::size_t i = 0; i < trajectory_trail_.size(); ++i)
+    delete trajectory_trail_[i];
+  trajectory_trail_.clear();
 }
 
-void TrajectoryDisplay::onDisable()
+void TrajectoryVisualization::changedLoopDisplay()
 {
-  Display::onDisable();
-  trajectory_visual_->onDisable();
+  display_path_robot_->setVisible(display_->isEnabled() && displaying_trajectory_message_ && animating_path_);
+  if (loop_display_property_->getBool() && trajectory_slider_panel_)
+    trajectory_slider_panel_->pauseButton(false);
 }
 
-void TrajectoryDisplay::update(float wall_dt, float ros_dt)
+void TrajectoryVisualization::changedShowTrail()
 {
-  Display::update(wall_dt, ros_dt);
+  clearTrajectoryTrail();
 
-  if (load_robot_model_)
-    loadRobotModel();
+  if (!trail_display_property_->getBool())
+    return;
+  robot_trajectory::RobotTrajectoryPtr t = trajectory_message_to_display_;
+  if (!t)
+    t = displaying_trajectory_message_;
+  if (!t)
+    return;
 
-  trajectory_visual_->update(wall_dt, ros_dt);
+  int stepsize = trail_step_size_property_->getInt();
+  // always include last trajectory point
+  trajectory_trail_.resize((int)std::ceil((t->getWayPointCount() + stepsize - 1) / (float)stepsize));
+  for (std::size_t i = 0; i < trajectory_trail_.size(); i++)
+  {
+    int waypoint_i = std::min(i * stepsize, t->getWayPointCount() - 1);  // limit to last trajectory point
+    rviz::Robot* r = new rviz::Robot(scene_node_, context_, "Trail Robot " + boost::lexical_cast<std::string>(i), NULL);
+    r->load(*robot_model_->getURDF());
+    r->setVisualVisible(display_path_visual_enabled_property_->getBool());
+    r->setCollisionVisible(display_path_collision_enabled_property_->getBool());
+    r->setAlpha(robot_path_alpha_property_->getFloat());
+    r->update(PlanningLinkUpdater(t->getWayPointPtr(waypoint_i)));
+    if (enable_robot_color_property_->getBool())
+      setRobotColor(r, robot_color_property_->getColor());
+    r->setVisible(display_->isEnabled() && (!animating_path_ || waypoint_i <= current_state_));
+    trajectory_trail_[i] = r;
+  }
 }
 
-void TrajectoryDisplay::setName(const QString& name)
+void TrajectoryVisualization::changedTrailStepSize()
 {
-  BoolProperty::setName(name);
-  trajectory_visual_->setName(name);
+  if (trail_display_property_->getBool())
+    changedShowTrail();
 }
 
-void TrajectoryDisplay::changedRobotDescription()
+void TrajectoryVisualization::changedRobotPathAlpha()
 {
-  if (isEnabled())
-    reset();
+  display_path_robot_->setAlpha(robot_path_alpha_property_->getFloat());
+  for (std::size_t i = 0; i < trajectory_trail_.size(); ++i)
+    trajectory_trail_[i]->setAlpha(robot_path_alpha_property_->getFloat());
+}
+
+void TrajectoryVisualization::changedTrajectoryTopic()
+{
+  trajectory_topic_sub_.shutdown();
+  if (!trajectory_topic_property_->getStdString().empty())
+  {
+    trajectory_topic_sub_ = update_nh_.subscribe(trajectory_topic_property_->getStdString(), 2,
+                                                 &TrajectoryVisualization::incomingDisplayTrajectory, this);
+  }
+}
+
+void TrajectoryVisualization::changedDisplayPathVisualEnabled()
+{
+  if (display_->isEnabled())
+  {
+    display_path_robot_->setVisualVisible(display_path_visual_enabled_property_->getBool());
+    display_path_robot_->setVisible(display_->isEnabled() && displaying_trajectory_message_ && animating_path_);
+    for (std::size_t i = 0; i < trajectory_trail_.size(); ++i)
+      trajectory_trail_[i]->setVisualVisible(display_path_visual_enabled_property_->getBool());
+  }
+}
+
+void TrajectoryVisualization::changedStateDisplayTime()
+{
+}
+
+void TrajectoryVisualization::changedDisplayPathCollisionEnabled()
+{
+  if (display_->isEnabled())
+  {
+    display_path_robot_->setCollisionVisible(display_path_collision_enabled_property_->getBool());
+    display_path_robot_->setVisible(display_->isEnabled() && displaying_trajectory_message_ && animating_path_);
+    for (std::size_t i = 0; i < trajectory_trail_.size(); ++i)
+      trajectory_trail_[i]->setCollisionVisible(display_path_collision_enabled_property_->getBool());
+  }
+}
+
+void TrajectoryVisualization::onEnable()
+{
+  changedRobotPathAlpha();  // set alpha property
+
+  display_path_robot_->setVisualVisible(display_path_visual_enabled_property_->getBool());
+  display_path_robot_->setCollisionVisible(display_path_collision_enabled_property_->getBool());
+  display_path_robot_->setVisible(displaying_trajectory_message_ && animating_path_);
+  for (std::size_t i = 0; i < trajectory_trail_.size(); ++i)
+  {
+    trajectory_trail_[i]->setVisualVisible(display_path_visual_enabled_property_->getBool());
+    trajectory_trail_[i]->setCollisionVisible(display_path_collision_enabled_property_->getBool());
+    trajectory_trail_[i]->setVisible(true);
+  }
+
+  changedTrajectoryTopic();  // load topic at startup if default used
+}
+
+void TrajectoryVisualization::onDisable()
+{
+  display_path_robot_->setVisible(false);
+  for (std::size_t i = 0; i < trajectory_trail_.size(); ++i)
+    trajectory_trail_[i]->setVisible(false);
+  displaying_trajectory_message_.reset();
+  animating_path_ = false;
+  if (trajectory_slider_panel_)
+    trajectory_slider_panel_->onDisable();
+}
+
+void TrajectoryVisualization::interruptCurrentDisplay()
+{
+  // update() starts a new trajectory as soon as it is available
+  // interrupting may cause the newly received trajectory to interrupt
+  // hence, only interrupt when current_state_ already advanced past first
+  if (current_state_ > 0)
+    animating_path_ = false;
+}
+
+float TrajectoryVisualization::getStateDisplayTime()
+{
+  std::string tm = state_display_time_property_->getStdString();
+  if (tm == "REALTIME")
+    return -1.0;
   else
-    loadRobotModel();
+  {
+    boost::replace_all(tm, "s", "");
+    boost::trim(tm);
+    float t = 0.05f;
+    try
+    {
+      t = boost::lexical_cast<float>(tm);
+    }
+    catch (const boost::bad_lexical_cast& ex)
+    {
+      state_display_time_property_->setStdString("0.05 s");
+    }
+    return t;
+  }
+}
+
+void TrajectoryVisualization::dropTrajectory()
+{
+  drop_displaying_trajectory_ = true;
+}
+
+void TrajectoryVisualization::update(float wall_dt, float ros_dt)
+{
+  if (drop_displaying_trajectory_)
+  {
+    animating_path_ = false;
+    displaying_trajectory_message_.reset();
+    trajectory_slider_panel_->update(0);
+    drop_displaying_trajectory_ = false;
+  }
+  if (!animating_path_)
+  {  // finished last animation?
+    boost::interprocess::scoped_lock<boost::signals2::mutex> lock(update_trajectory_message_);
+
+    // new trajectory available to display?
+    if (trajectory_message_to_display_ && !trajectory_message_to_display_->empty())
+    {
+      animating_path_ = true;
+      displaying_trajectory_message_ = trajectory_message_to_display_;
+      changedShowTrail();
+      if (trajectory_slider_panel_)
+        trajectory_slider_panel_->update(trajectory_message_to_display_->getWayPointCount());
+    }
+    else if (displaying_trajectory_message_)
+    {
+      if (loop_display_property_->getBool())
+      {  // do loop? -> start over too
+        animating_path_ = true;
+      }
+      else if (trajectory_slider_panel_ && trajectory_slider_panel_->isVisible())
+      {
+        if (trajectory_slider_panel_->getSliderPosition() >= displaying_trajectory_message_->getWayPointCount() - 1)
+          return;  // nothing more to do
+        else
+          animating_path_ = true;
+      }
+    }
+    trajectory_message_to_display_.reset();
+
+    if (animating_path_)
+    {
+      // restart animation
+      current_state_ = -1;
+    }
+  }
+
+  if (animating_path_)
+  {
+    int previous_state = current_state_;
+    int waypoint_count = displaying_trajectory_message_->getWayPointCount();
+    current_state_time_ += wall_dt;
+    float tm = getStateDisplayTime();
+
+    if (trajectory_slider_panel_ && trajectory_slider_panel_->isVisible() && trajectory_slider_panel_->isPaused())
+      current_state_ = trajectory_slider_panel_->getSliderPosition();
+    else if (current_state_ < 0)
+    {  // special case indicating restart of animation
+      current_state_ = 0;
+      current_state_time_ = 0.0;
+    }
+    else if (tm < 0.0)
+    {  // using realtime: skip to next waypoint based on elapsed display time
+      while (current_state_ < waypoint_count &&
+             (tm = displaying_trajectory_message_->getWayPointDurationFromPrevious(current_state_ + 1)) <
+                 current_state_time_)
+      {
+        current_state_time_ -= tm;
+        ++current_state_;
+      }
+    }
+    else if (current_state_time_ > tm)
+    {  // fixed display time per state
+      current_state_time_ = 0.0;
+      ++current_state_;
+    }
+
+    if (current_state_ == previous_state)
+      return;
+
+    if (current_state_ < waypoint_count)
+    {
+      if (trajectory_slider_panel_)
+        trajectory_slider_panel_->setSliderPosition(current_state_);
+      display_path_robot_->update(displaying_trajectory_message_->getWayPointPtr(current_state_));
+      for (std::size_t i = 0; i < trajectory_trail_.size(); ++i)
+        trajectory_trail_[i]->setVisible(
+            std::min(waypoint_count - 1, static_cast<int>(i) * trail_step_size_property_->getInt()) <= current_state_);
+    }
+    else
+    {
+      animating_path_ = false;  // animation finished
+      display_path_robot_->setVisible(loop_display_property_->getBool());
+      if (!loop_display_property_->getBool() && trajectory_slider_panel_)
+        trajectory_slider_panel_->pauseButton(true);
+    }
+  }
+  // set visibility
+  display_path_robot_->setVisible(display_->isEnabled() && displaying_trajectory_message_ &&
+                                  (animating_path_ || trail_display_property_->getBool() ||
+                                   (trajectory_slider_panel_ && trajectory_slider_panel_->isVisible())));
+}
+
+void TrajectoryVisualization::incomingDisplayTrajectory(const moveit_msgs::DisplayTrajectory::ConstPtr& msg)
+{
+  // Error check
+  if (!robot_state_ || !robot_model_)
+  {
+    ROS_ERROR_STREAM_NAMED("trajectory_visualization", "No robot state or robot model loaded");
+    return;
+  }
+
+  if (!msg->model_id.empty() && msg->model_id != robot_model_->getName())
+    ROS_WARN("Received a trajectory to display for model '%s' but model '%s' was expected", msg->model_id.c_str(),
+             robot_model_->getName().c_str());
+
+  trajectory_message_to_display_.reset();
+
+  robot_trajectory::RobotTrajectoryPtr t(new robot_trajectory::RobotTrajectory(robot_model_, ""));
+  for (std::size_t i = 0; i < msg->trajectory.size(); ++i)
+  {
+    if (t->empty())
+    {
+      t->setRobotTrajectoryMsg(*robot_state_, msg->trajectory_start, msg->trajectory[i]);
+    }
+    else
+    {
+      robot_trajectory::RobotTrajectory tmp(robot_model_, "");
+      tmp.setRobotTrajectoryMsg(t->getLastWayPoint(), msg->trajectory[i]);
+      t->append(tmp, 0.0);
+    }
+  }
+
+  if (!t->empty())
+  {
+    boost::interprocess::scoped_lock<boost::signals2::mutex> lock(update_trajectory_message_);
+    trajectory_message_to_display_.swap(t);
+    if (interrupt_display_property_->getBool())
+      interruptCurrentDisplay();
+  }
+}
+
+void TrajectoryVisualization::changedRobotColor()
+{
+  if (enable_robot_color_property_->getBool())
+    setRobotColor(&(display_path_robot_->getRobot()), robot_color_property_->getColor());
+}
+
+void TrajectoryVisualization::enabledRobotColor()
+{
+  if (enable_robot_color_property_->getBool())
+    setRobotColor(&(display_path_robot_->getRobot()), robot_color_property_->getColor());
+  else
+    unsetRobotColor(&(display_path_robot_->getRobot()));
+}
+
+void TrajectoryVisualization::unsetRobotColor(rviz::Robot* robot)
+{
+  for (auto& link : robot->getLinks())
+    link.second->unsetColor();
+}
+
+void TrajectoryVisualization::setRobotColor(rviz::Robot* robot, const QColor& color)
+{
+  for (auto& link : robot->getLinks())
+    robot->getLink(link.first)->setColor(color.redF(), color.greenF(), color.blueF());
+}
+
+void TrajectoryVisualization::trajectorySliderPanelVisibilityChange(bool enable)
+{
+  if (!trajectory_slider_panel_)
+    return;
+
+  if (enable)
+    trajectory_slider_panel_->onEnable();
+  else
+    trajectory_slider_panel_->onDisable();
 }
 
 }  // namespace moveit_rviz_plugin
